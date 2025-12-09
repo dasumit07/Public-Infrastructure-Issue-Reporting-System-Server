@@ -49,9 +49,27 @@ async function run() {
         if(email){
             query.reporterEmail = email;
         }
-        const result =  await issuesCollection.find(query).toArray();
+        const option = {
+            sort: { createdAt: -1 }}
+        const result =  await issuesCollection.find(query, option).toArray();
         res.send(result);
     });
+    app.delete('/issues/:id', async (req, res)=>{
+      const {id} = req.params;
+      const objectId = new ObjectId(id);
+      const result = await issuesCollection.deleteOne({_id: objectId});
+      res.send(result);
+    })
+    app.put('/issues/:id', async (req, res)=>{
+      const {id} = req.params;
+      const data = req.body;
+      const objectId = new ObjectId(id);
+      const update = {
+        $set: data
+      }
+      const result = await issuesCollection.updateOne({_id: objectId}, update);
+      res.send(result);
+    })
 
 
     // Send a ping to confirm a successful connection
