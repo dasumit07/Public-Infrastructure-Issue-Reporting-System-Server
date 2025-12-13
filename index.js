@@ -62,6 +62,7 @@ async function run() {
     app.post('/users', async (req, res) => {
       const user = req.body;
       user.role = 'user';
+      user.status = 'active';
       user.createdAt = new Date();
       const userExits = await userCollection.findOne({ email: user.email });
       if (userExits) {
@@ -70,7 +71,21 @@ async function run() {
       const result = await userCollection.insertOne(user);
       res.send(result);
     })
-    
+    app.get('/users', async (req, res) => {
+      const result = await userCollection.find({}, { sort: { createdAt: -1 } }).toArray();
+      res.send(result);
+    });
+    app.patch('/users/:id/status', verifyFBToken, async (req, res) => {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      const result = await userCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status } }
+      );
+
+      res.send(result);
+    });
 
     // staff api
     app.post('/staff', async (req, res) => {
