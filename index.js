@@ -5,7 +5,6 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express()
 const port = process.env.PORT || 3000
 const admin = require("firebase-admin");
-
 const serviceAccount = require("./issue-reporting-system--firebase-admin.json");
 
 admin.initializeApp({
@@ -33,6 +32,7 @@ const verifyFBToken = async (req, res, next) => {
   next();
 }
 
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.kfapxri.mongodb.net/?appName=Cluster0`;
 
 function generateTrackingId() {
@@ -58,6 +58,31 @@ async function run() {
     const userCollection = db.collection("users");
     const staffCollection = db.collection("staff");
 
+    // middleware
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const email = req.decoded_email;
+        console.log("Decoded email:", email);
+        const user = await userCollection.findOne({ email });
+        console.log("User from DB:", user);
+        if (user && user.role === 'admin') {
+          return next();
+        }
+
+        const staff = await staffCollection.findOne({ email });
+        console.log("Staff from DB:", staff);
+        if (staff && staff.role === 'admin') {
+          return next();
+        }
+
+        return res.status(403).send({ message: 'Forbidden access' });
+
+      } catch (error) {
+        console.error('verifyAdmin error:', error);
+        res.status(500).send({ message: 'Server error' });
+      }
+    };
+
     // users api
     app.post('/users', async (req, res) => {
       const user = req.body;
@@ -71,11 +96,11 @@ async function run() {
       const result = await userCollection.insertOne(user);
       res.send(result);
     })
-    app.get('/users', async (req, res) => {
+    app.get('/users', verifyFBToken, verifyAdmin, async (req, res) => {
       const result = await userCollection.find({}, { sort: { createdAt: -1 } }).toArray();
       res.send(result);
     });
-    app.patch('/users/:id/status', verifyFBToken, async (req, res) => {
+    app.patch('/users/:id/status', verifyFBToken, verifyAdmin, async (req, res) => {
       const { id } = req.params;
       const { status } = req.body;
 
@@ -86,20 +111,66 @@ async function run() {
 
       res.send(result);
     });
+    // role api
+    app.get('/role', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+
+      const user = await userCollection.findOne({ email });
+      if (user) {
+        return res.send({
+          role: user.role
+        });
+      }
+
+      const staff = await staffCollection.findOne({ email });
+      if (staff) {
+        return res.send({
+          role: staff.role
+        });
+      }
+
+      res.status(404).send({ role: 'unknown' });
+    })
 
     // staff api
-    app.post('/staff', async (req, res) => {
-      const staff = req.body;
-      staff.role = 'staff';
-      staff.createdAt = new Date();
-      const result = await staffCollection.insertOne(staff);
-      res.send(result);
+
+    app.post('/create-staff', verifyFBToken, verifyAdmin, async (req, res) => {
+      try {
+        const { email, password, name, photoURL, phone } = req.body;
+
+        const userRecord = await admin.auth().createUser({
+          email,
+          password,
+          displayName: name,
+          photoURL
+        });
+
+        await staffCollection.insertOne({
+          uid: userRecord.uid,
+          email,
+          phone,
+          name,
+          photoURL,
+          role: 'staff',
+          status: 'active',
+          createdAt: new Date()
+        });
+
+        res.send({ success: true });
+      } catch (error) {
+        console.error('Create staff error:', error);
+        res.status(400).send({
+          success: false,
+          message: error.message
+        });
+      }
     });
-    app.get('/staffs', async (req, res) => {
+
+    app.get('/staffs', verifyFBToken, verifyAdmin, async (req, res) => {
       const result = await staffCollection.find({}, { sort: { createdAt: -1 } }).toArray();
       res.send(result);
     });
-    app.put('/staff/:id', async (req, res) => {
+    app.put('/staff/:id', verifyFBToken, verifyAdmin, async (req, res) => {
       const { id } = req.params;
       const data = req.body;
       const objectId = new ObjectId(id);
@@ -109,14 +180,22 @@ async function run() {
       const result = await staffCollection.updateOne({ _id: objectId }, update);
       res.send(result);
     })
-    app.delete('/staff/:id', async (req, res) => {
+    app.delete('/staff/:id', verifyFBToken, verifyAdmin, async (req, res) => {
       const { id } = req.params;
       const objectId = new ObjectId(id);
       const result = await staffCollection.deleteOne({ _id: objectId });
       res.send(result);
     })
+    app.get('/staff/issues', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const result = await issuesCollection.find({
+        'assignedStaff.email': email
+      }).toArray();
+
+      res.send(result);
+    });
     // issue api
-    app.post('/issues', async (req, res) => {
+    app.post('/issues', verifyFBToken, async (req, res) => {
       const issue = req.body;
       issue.trackingId = generateTrackingId();
       issue.priority = "Normal";
@@ -125,16 +204,16 @@ async function run() {
       res.send(result);
     });
     app.get('/issues/all', async (req, res) => {
-      const result = await issuesCollection.find({}, { sort: { priority: -1 } }).toArray();
+      const result = await issuesCollection.find({}, { sort: { priority: 1 } }).toArray();
       res.send(result);
     });
-    app.get('/issues/:id', async (req, res) => {
+    app.get('/issues/:id', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const objectId = new ObjectId(id);
       const result = await issuesCollection.findOne({ _id: objectId });
       res.send(result);
     })
-    app.get('/issues', async (req, res) => {
+    app.get('/issues', verifyFBToken, async (req, res) => {
       const email = req.query.email;
       const query = {};
       if (email) {
@@ -162,8 +241,61 @@ async function run() {
       const result = await issuesCollection.updateOne({ _id: objectId }, update);
       res.send(result);
     })
+    app.patch('/issues/:id/assign-staff', verifyFBToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+      const { staff } = req.body;
+
+      const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+      if (issue.assignedStaff) {
+        return res.status(400).send({ message: 'Staff already assigned' });
+      }
+
+      const result = await issuesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            assignedStaff: staff
+          },
+          $push: {
+            timeline: {
+              action: 'Assigned to staff',
+              staffEmail: staff.email,
+              at: new Date()
+            }
+          }
+        }
+      );
+
+      res.send({ success: true });
+    });
+    app.patch('/issues/:id/reject', verifyFBToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+
+      const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+
+      if (issue.status !== 'pending') {
+        return res.status(400).send({ message: 'Only pending issues can be rejected' });
+      }
+
+      const result = await issuesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: { status: 'rejected' },
+          $push: {
+            timeline: {
+              action: 'Issue rejected by admin',
+              at: new Date()
+            }
+          }
+        }
+      );
+
+      res.send({ success: true });
+    });
+
+
     // payment api
-    app.post('/create-payment-intent', async (req, res) => {
+    app.post('/create-payment-intent', verifyFBToken, async (req, res) => {
       const paymentInfo = req.body;
       const amount = 79;
       const session = await stripe.checkout.sessions.create({
@@ -226,7 +358,7 @@ async function run() {
         }
       }
     });
-    app.get('/all-payments', verifyFBToken, async (req, res) => {
+    app.get('/all-payments', verifyFBToken, verifyAdmin, async (req, res) => {
       // admin email
       const adminEmail = 'sd3034734@gmail.com';
       if (req.decoded_email !== adminEmail) {
