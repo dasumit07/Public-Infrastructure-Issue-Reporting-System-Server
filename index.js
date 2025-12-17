@@ -190,16 +190,26 @@ async function run() {
       const email = req.decoded_email;
       const result = await issuesCollection.find({
         'assignedStaff.email': email
-      }).toArray();
+      }).sort({ paymentStatus: 1 }).toArray();
 
       res.send(result);
     });
     // issue api
     app.post('/issues', verifyFBToken, async (req, res) => {
       const issue = req.body;
+      const email = req.decoded_email;
       issue.trackingId = generateTrackingId();
       issue.priority = "Normal";
       issue.paymentStatus = "unpaid";
+      issue.timeline = [
+        {
+          action: "ISSUE_REPORTED",
+          message: "Issue reported by citizen",
+          updatedBy: "Citizen",
+          name: issue.reporterName,
+          at: new Date()
+        }
+      ];
       const result = await issuesCollection.insertOne(issue);
       res.send(result);
     });
@@ -231,15 +241,55 @@ async function run() {
       const result = await issuesCollection.deleteOne({ _id: objectId });
       res.send(result);
     })
-    app.put('/issues/:id', async (req, res) => {
+    app.put('/issues/:id', verifyFBToken, async (req, res) => {
       const { id } = req.params;
+      const email = req.decoded_email;
       const data = req.body;
       const objectId = new ObjectId(id);
-      const update = {
-        $set: data
-      }
-      const result = await issuesCollection.updateOne({ _id: objectId }, update);
-      res.send(result);
+
+      if (data.status) {
+        const issue = await issuesCollection.findOne({ _id: objectId });
+
+        if (!issue) {
+          return res.status(404).send({ message: "Issue not found" });
+        }
+        const getStatusMessage = (status) => {
+            if(status === "pending"){
+              return "Issue marked as pending";
+            }
+            if(status === "in_progress"){
+              return "Work started on the issue";
+            }
+            if(status === "working"){
+              return "Issue is currently being worked on";
+            }
+            if(status === "resolved"){
+              return "Issue marked as resolved";
+            }
+            if(status === "closed"){
+              return "Issue closed by staff";
+            }
+        };
+        const timelineEntry = {
+          action: "STATUS_CHANGED",
+          status: data.status,
+          message: getStatusMessage(data.status) ,
+          updatedBy: 'Staff',
+          at: new Date()
+        };
+        const update = {
+          $set: data,
+          $push: { timeline: timelineEntry }
+        }
+        const result = await issuesCollection.updateOne({ _id: objectId }, update);
+        res.send(result);
+      } else {
+        const update = {
+          $set: data
+        }
+        const result = await issuesCollection.updateOne({ _id: objectId }, update);
+        res.send(result);
+      };
     })
     app.patch('/issues/:id/assign-staff', verifyFBToken, verifyAdmin, async (req, res) => {
       const { id } = req.params;
@@ -258,8 +308,9 @@ async function run() {
           },
           $push: {
             timeline: {
-              action: 'Assigned to staff',
-              staffEmail: staff.email,
+              action: 'STAFF_ASSIGNED',
+              message: 'Issue assigned to staff',
+              updatedBy: 'Admin',
               at: new Date()
             }
           }
@@ -283,7 +334,9 @@ async function run() {
           $set: { status: 'rejected' },
           $push: {
             timeline: {
-              action: 'Issue rejected by admin',
+              action: 'ISSUE_REJECTED',
+              message: 'Issue has been rejected',
+              updatedBy: 'Admin',
               at: new Date()
             }
           }
@@ -338,6 +391,14 @@ async function run() {
           $set: {
             paymentStatus: 'paid',
             priority: 'High'
+          },
+          $push: {
+            timeline: {
+              action: 'ISSUE_BOOSTED',
+              message: 'Issue has been boosted',
+              updatedBy: 'Citizen',
+              at: new Date()
+            }
           }
         }
         const result = await issuesCollection.updateOne(query, update);
