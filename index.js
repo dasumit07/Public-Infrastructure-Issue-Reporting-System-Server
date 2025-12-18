@@ -254,26 +254,26 @@ async function run() {
           return res.status(404).send({ message: "Issue not found" });
         }
         const getStatusMessage = (status) => {
-            if(status === "pending"){
-              return "Issue marked as pending";
-            }
-            if(status === "in_progress"){
-              return "Work started on the issue";
-            }
-            if(status === "working"){
-              return "Issue is currently being worked on";
-            }
-            if(status === "resolved"){
-              return "Issue marked as resolved";
-            }
-            if(status === "closed"){
-              return "Issue closed by staff";
-            }
+          if (status === "pending") {
+            return "Issue marked as pending";
+          }
+          if (status === "in_progress") {
+            return "Work started on the issue";
+          }
+          if (status === "working") {
+            return "Issue is currently being worked on";
+          }
+          if (status === "resolved") {
+            return "Issue marked as resolved";
+          }
+          if (status === "closed") {
+            return "Issue closed by staff";
+          }
         };
         const timelineEntry = {
           action: "STATUS_CHANGED",
           status: data.status,
-          message: getStatusMessage(data.status) ,
+          message: getStatusMessage(data.status),
           updatedBy: 'Staff',
           at: new Date()
         };
@@ -371,7 +371,7 @@ async function run() {
           name: paymentInfo.title,
           trackingId: paymentInfo.trackingId
         },
-        success_url: `${process.env.SITE_DOMAIN}/issues/${paymentInfo.issueId}?session_id={CHECKOUT_SESSION_ID}`,
+        success_url: `${process.env.SITE_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.SITE_DOMAIN}/issues/${paymentInfo.issueId}?payment=failed`,
       });
       res.send({ url: session.url });
@@ -421,13 +421,156 @@ async function run() {
     });
     app.get('/all-payments', verifyFBToken, verifyAdmin, async (req, res) => {
       // admin email
-      const adminEmail = 'sd3034734@gmail.com';
+      const adminEmail = 'admin@gmail.com';
       if (req.decoded_email !== adminEmail) {
         return res.status(403).send({ message: ' access' })
       }
       const result = await paymentsCollection.find().sort({ paidAt: -1 }).toArray();
       res.send(result);
     })
+    //Citizen Aggregation Pipeline api
+    const issueStatsPipeline = (email) => [
+      {
+        $match: { reporterEmail: email }
+      },
+      {
+        $group: {
+          _id: null,
+          totalIssues: { $sum: 1 },
+
+          pending: {
+            $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] }
+          },
+
+          inProgress: {
+            $sum: { $cond: [{ $eq: ["$status", "in_progress"] }, 1, 0] }
+          },
+
+          working: {
+            $sum: { $cond: [{ $eq: ["$status", "working"] }, 1, 0] }
+          },
+
+          resolved: {
+            $sum: { $cond: [{ $eq: ["$status", "resolved"] }, 1, 0] }
+          }
+        }
+      }
+    ];
+
+
+    const paymentStatsPipeline = (email) => [
+      { $match: { email } },
+      {
+        $group: {
+          _id: null,
+          totalPayments: { $sum: "$amount" },
+          totalTransactions: { $sum: 1 }
+        }
+      }
+    ];
+    app.get('/citizen-dashboard-stats', async (req, res) => {
+      const email = req.query.email;
+
+      const issueStats = await issuesCollection
+        .aggregate(issueStatsPipeline(email))
+        .toArray();
+
+      const paymentStats = await paymentsCollection
+        .aggregate(paymentStatsPipeline(email))
+        .toArray();
+
+      res.send({
+        issueStats: issueStats[0] || {
+          totalIssues: 0,
+          pending: 0,
+          inProgress: 0,
+          working: 0,
+          resolved: 0,
+        },
+        paymentStats: paymentStats[0] || {
+          totalPayments: 0,
+          totalTransactions: 0
+        }
+      });
+    });
+
+    //Staff Aggregation Pipeline api
+    const staffDashboardPipeline = (email) => [
+      {
+        $match: {
+          "assignedStaff.email": email
+        }
+      },
+      {
+        $group: {
+          _id: null,
+
+          assignedIssues: { $sum: 1 },
+
+          resolvedIssues: {
+            $sum: { $cond: [{ $eq: ["$status", "resolved"] }, 1, 0] }
+          },
+
+          working: {
+            $sum: { $cond: [{ $eq: ["$status", "working"] }, 1, 0] }
+          },
+
+          inProgress: {
+            $sum: { $cond: [{ $eq: ["$status", "in_progress"] }, 1, 0] }
+          },
+
+          pending: {
+            $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] }
+          }
+        }
+      }
+    ];
+
+    const todayTaskPipeline = (staffEmail) => {
+      const now = new Date();
+
+      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+      const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+
+      return [
+        {
+          $match: {
+            "assignedStaff.email": staffEmail, 
+            timeline: {
+              $elemMatch: {
+                action: "STAFF_ASSIGNED",
+                at: { $gte: start, $lte: end } 
+              }
+            }
+          }
+        }
+      ];
+    };
+
+
+
+    app.get('/staff-dashboard-stats', async (req, res) => {
+      const email = req.query.email;
+      const statsArr = await issuesCollection
+        .aggregate(staffDashboardPipeline(email))
+        .toArray();
+
+      const todayTasks = await issuesCollection
+        .aggregate(todayTaskPipeline(email))
+        .toArray();
+
+      res.send({
+        stats: statsArr[0] || {
+          assignedIssues: 0,
+          resolvedIssues: 0,
+          working: 0,
+          inProgress: 0,
+          pending: 0
+        },
+        todayTasks: todayTasks || []
+      });
+    });
+
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
