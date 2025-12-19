@@ -88,6 +88,8 @@ async function run() {
       const user = req.body;
       user.role = 'user';
       user.status = 'active';
+      user.isPremium = false;
+      user.premiumSince = null;
       user.createdAt = new Date();
       const userExits = await userCollection.findOne({ email: user.email });
       if (userExits) {
@@ -110,6 +112,100 @@ async function run() {
       );
 
       res.send(result);
+    });
+    app.get('/profile', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const user = await userCollection.findOne({ email });
+      if (!user) {
+        return res.status(404).send({ message: 'User not found' });
+      }
+      res.send(user);
+    });
+    app.patch('/profile', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const { displayName, photoURL } = req.body;
+
+      const result = await userCollection.updateOne(
+        { email },
+        { $set: { displayName, photoURL } }
+      );
+
+      res.send(result);
+    });
+    app.post('/subscribe', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const user = await userCollection.findOne({ email });
+
+      if (user?.status === 'blocked') {
+        return res.status(403).send({
+          message: 'Your account is blocked. You cannot boost issues.'
+        });
+      }
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              unit_amount: 787,
+              product_data: {
+                name: 'Premium Subscription',
+              },
+            },
+            quantity: 1,
+          },
+        ],
+        customer_email: email,
+        mode: 'payment',
+        success_url: `${process.env.SITE_DOMAIN}/dashboard/profile?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.SITE_DOMAIN}/dashboard/profile`,
+      });
+
+      res.send({ url: session.url });
+    });
+    app.patch('/subscription-success', async (req, res) => {
+      try {
+        const sessionId = req.query.session_id;
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== 'paid') {
+          return res.status(400).send({ message: 'Payment not completed' });
+        }
+
+        const transactionId = session.payment_intent;
+
+        const exists = await paymentsCollection.findOne({ transactionId });
+        if (exists) {
+          return res.send({ message: 'Already processed' });
+        }
+
+        await userCollection.updateOne(
+          { email: session.customer_email },
+          {
+            $set: {
+              isPremium: true,
+              premiumSince: new Date()
+            }
+          }
+        );
+
+        const paymentRecord = {
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          email: session.customer_email,
+          name: "Premium Subscription",
+          transactionId,
+          paymentStatus: session.payment_status,
+          paidAt: new Date()
+        };
+
+        await paymentsCollection.insertOne(paymentRecord);
+
+        return res.send({ success: true });
+
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: 'Server error' });
+      }
     });
     // role api
     app.get('/role', verifyFBToken, async (req, res) => {
@@ -166,7 +262,7 @@ async function run() {
       }
     });
 
-    app.get('/staffs', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.get('/staffs', verifyFBToken, async (req, res) => {
       const result = await staffCollection.find({}, { sort: { createdAt: -1 } }).toArray();
       res.send(result);
     });
@@ -194,10 +290,40 @@ async function run() {
 
       res.send(result);
     });
+    app.patch('/staff-profile', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const { displayName, photoURL } = req.body;
+
+      const result = await staffCollection.updateOne(
+        { email },
+        { $set: { name: displayName, photoURL } }
+      );
+
+      res.send(result);
+    });
     // issue api
     app.post('/issues', verifyFBToken, async (req, res) => {
-      const issue = req.body;
       const email = req.decoded_email;
+
+      const user = await userCollection.findOne({ email });
+
+      if (user.status === 'blocked') {
+        return res.status(403).send({ message: 'Account blocked' });
+      }
+
+      if (!user.isPremium) {
+        const issueCount = await issuesCollection.countDocuments({
+          reporterEmail: email
+        });
+
+        if (issueCount >= 3) {
+          return res.status(403).send({
+            message: 'Issue limit reached. Please subscribe to premium.'
+          });
+        }
+      }
+
+      const issue = req.body;
       issue.trackingId = generateTrackingId();
       issue.priority = "Normal";
       issue.paymentStatus = "unpaid";
@@ -210,9 +336,11 @@ async function run() {
           at: new Date()
         }
       ];
+
       const result = await issuesCollection.insertOne(issue);
       res.send(result);
     });
+
     app.get('/issues/all', async (req, res) => {
       const result = await issuesCollection.find({}, { sort: { priority: 1 } }).toArray();
       res.send(result);
@@ -332,6 +460,7 @@ async function run() {
         { _id: new ObjectId(id) },
         {
           $set: { status: 'rejected' },
+          $unset: { assignedStaff: "" },
           $push: {
             timeline: {
               action: 'ISSUE_REJECTED',
@@ -346,9 +475,50 @@ async function run() {
       res.send({ success: true });
     });
 
+    app.post('/issues/:id/upvote', verifyFBToken, async (req, res) => {
+      const { id } = req.params;
+      const email = req.decoded_email;
+
+      try {
+        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        if (!issue) return res.status(404).send({ message: 'Issue not found' });
+
+        if (issue.reporterEmail === email) {
+          return res.status(403).send({ message: 'You cannot upvote your own issue' });
+        }
+
+        if (issue.upVotes && issue.upVotes.includes(email)) {
+          return res.status(400).send({ message: 'You already upvoted this issue' });
+        }
+
+        const result = await issuesCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $push: { upVotes: email } } 
+        );
+
+        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+
+        res.send({
+          message: 'Upvoted successfully',
+          upvoteCount: updatedIssue.upVotes ? updatedIssue.upVotes.length : 0
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: 'Server error' });
+      }
+    });
 
     // payment api
     app.post('/create-payment-intent', verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+
+      const user = await userCollection.findOne({ email });
+
+      if (user?.status === 'blocked') {
+        return res.status(403).send({
+          message: 'Your account is blocked. You cannot boost issues.'
+        });
+      }
       const paymentInfo = req.body;
       const amount = 79;
       const session = await stripe.checkout.sessions.create({
@@ -535,20 +705,17 @@ async function run() {
       return [
         {
           $match: {
-            "assignedStaff.email": staffEmail, 
+            "assignedStaff.email": staffEmail,
             timeline: {
               $elemMatch: {
                 action: "STAFF_ASSIGNED",
-                at: { $gte: start, $lte: end } 
+                at: { $gte: start, $lte: end }
               }
             }
           }
         }
       ];
     };
-
-
-
     app.get('/staff-dashboard-stats', async (req, res) => {
       const email = req.query.email;
       const statsArr = await issuesCollection
@@ -570,6 +737,66 @@ async function run() {
         todayTasks: todayTasks || []
       });
     });
+
+    //Admin Aggregation Pipeline api
+    const adminIssueStatsPipeline = [
+      {
+        $group: {
+          _id: null,
+          totalIssues: { $sum: 1 },
+          resolved: { $sum: { $cond: [{ $eq: ["$status", "resolved"] }, 1, 0] } },
+          pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
+          rejected: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] } }
+        }
+      }
+    ];
+
+    const adminPaymentStatsPipeline = [
+      {
+        $group: {
+          _id: null,
+          totalPayments: { $sum: "$amount" },
+          totalTransactions: { $sum: 1 }
+        }
+      }
+    ];
+
+    const latestIssuesPipeline = [
+      { $sort: { createdAt: -1 } },
+      { $limit: 5 }
+    ];
+
+    const latestPaymentsPipeline = [
+      { $sort: { paidAt: -1 } },
+      { $limit: 5 }
+    ];
+
+    const latestUsersPipeline = [
+      { $sort: { createdAt: -1 } },
+      { $limit: 5 }
+    ];
+    app.get("/admin-dashboard-stats", async (req, res) => {
+      try {
+        const issueStats = await issuesCollection.aggregate(adminIssueStatsPipeline).toArray();
+        const paymentStats = await paymentsCollection.aggregate(adminPaymentStatsPipeline).toArray();
+        const latestIssues = await issuesCollection.aggregate(latestIssuesPipeline).toArray();
+        const latestPayments = await paymentsCollection.aggregate(latestPaymentsPipeline).toArray();
+        const latestUsers = await userCollection.aggregate(latestUsersPipeline).toArray();
+
+        res.send({
+          issueStats: issueStats || { totalIssues: 0, resolved: 0, pending: 0, rejected: 0 },
+          paymentStats: paymentStats || { totalPayments: 0, totalTransactions: 0 },
+          latestIssues,
+          latestPayments,
+          latestUsers
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ error: "Server Error" });
+      }
+    });
+
+
 
 
     // Send a ping to confirm a successful connection
