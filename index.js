@@ -62,15 +62,15 @@ async function run() {
     const verifyAdmin = async (req, res, next) => {
       try {
         const email = req.decoded_email;
-        console.log("Decoded email:", email);
+
         const user = await userCollection.findOne({ email });
-        console.log("User from DB:", user);
+
         if (user && user.role === 'admin') {
           return next();
         }
 
         const staff = await staffCollection.findOne({ email });
-        console.log("Staff from DB:", staff);
+
         if (staff && staff.role === 'admin') {
           return next();
         }
@@ -82,7 +82,38 @@ async function run() {
         res.status(500).send({ message: 'Server error' });
       }
     };
+    const verifyStaff = async (req, res, next) => {
+      try {
+        const email = req.decoded_email;
 
+        const staff = await staffCollection.findOne({ email });
+
+        if (staff && staff.role === 'staff' && staff.status === 'active') {
+          return next();
+        }
+
+        return res.status(403).send({ message: 'Forbidden access: Not a staff member or inactive' });
+      } catch (error) {
+        console.error('verifyStaff error:', error);
+        res.status(500).send({ message: 'Server error' });
+      }
+    };
+    const verifyUser = async (req, res, next) => {
+      try {
+        const email = req.decoded_email;
+
+        const user = await userCollection.findOne({ email });
+
+        if (user && user.role === 'user' && user.status === 'active') {
+          return next();
+        }
+
+        return res.status(403).send({ message: 'Forbidden access: Not a user or inactive' });
+      } catch (error) {
+        console.error('verifyUser error:', error);
+        res.status(500).send({ message: 'Server error' });
+      }
+    };
     // users api
     app.post('/users', async (req, res) => {
       const user = req.body;
@@ -98,11 +129,11 @@ async function run() {
       const result = await userCollection.insertOne(user);
       res.send(result);
     })
-    app.get('/users', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.get('/users', verifyFBToken, async (req, res) => {
       const result = await userCollection.find({}, { sort: { createdAt: -1 } }).toArray();
       res.send(result);
     });
-    app.patch('/users/:id/status', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.patch('/users/:id/status', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const { status } = req.body;
 
@@ -230,7 +261,7 @@ async function run() {
 
     // staff api
 
-    app.post('/create-staff', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.post('/create-staff', verifyFBToken, async (req, res) => {
       try {
         const { email, password, name, photoURL, phone } = req.body;
 
@@ -266,7 +297,7 @@ async function run() {
       const result = await staffCollection.find({}, { sort: { createdAt: -1 } }).toArray();
       res.send(result);
     });
-    app.put('/staff/:id', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.put('/staff/:id', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const data = req.body;
       const objectId = new ObjectId(id);
@@ -276,7 +307,7 @@ async function run() {
       const result = await staffCollection.updateOne({ _id: objectId }, update);
       res.send(result);
     })
-    app.delete('/staff/:id', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.delete('/staff/:id', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const objectId = new ObjectId(id);
       const result = await staffCollection.deleteOne({ _id: objectId });
@@ -284,10 +315,13 @@ async function run() {
     })
     app.get('/staff/issues', verifyFBToken, async (req, res) => {
       const email = req.decoded_email;
-      const result = await issuesCollection.find({
-        'assignedStaff.email': email
-      }).sort({ paymentStatus: 1 }).toArray();
+      const { status, priority } = req.query;
 
+      const query = { 'assignedStaff.email': email };
+      if (status) query.status = status;
+      if (priority) query.priority = priority;
+
+      const result = await issuesCollection.find(query).sort({ paymentStatus: 1 }).toArray();
       res.send(result);
     });
     app.patch('/staff-profile', verifyFBToken, async (req, res) => {
@@ -340,11 +374,54 @@ async function run() {
       const result = await issuesCollection.insertOne(issue);
       res.send(result);
     });
+    app.get('/issues/latest-resolved', async (req, res) => {
+      try {
+        const result = await issuesCollection
+          .find({ status: "resolved" })
+          .sort({ updatedAt: -1 })
+          .limit(6)
+          .toArray();
 
-    app.get('/issues/all', async (req, res) => {
-      const result = await issuesCollection.find({}, { sort: { priority: 1 } }).toArray();
-      res.send(result);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Server error" });
+      }
     });
+    app.get('/issues/all', async (req, res) => {
+      try {
+        const { search, status, priority, category, page = 1, limit = 10 } = req.query;
+        const query = {};
+
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: 'i' } },
+            { description: { $regex: search, $options: 'i' } },
+            { location: { $regex: search, $options: 'i' } }
+          ];
+        }
+
+        if (status) query.status = status;
+        if (priority) query.priority = priority;
+        if (category) query.category = category;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const total = await issuesCollection.countDocuments(query); 
+        const result = await issuesCollection.find(query).skip(skip).limit(parseInt(limit)).sort({ priority: 1 }).toArray();
+
+        res.send({
+          data: result,
+          total,
+          page: parseInt(page),
+          totalPages: Math.ceil(total / parseInt(limit))
+        });
+      } catch (error) {
+        res.status(500).send({ message: 'Server Error' });
+      }
+    });
+    app.get('/issues/all-admin', verifyFBToken, async (req, res) => {
+      const result = await issuesCollection.find().sort({ priority: 1 }).toArray();
+      res.send(result);
+    })
     app.get('/issues/:id', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const objectId = new ObjectId(id);
@@ -352,11 +429,12 @@ async function run() {
       res.send(result);
     })
     app.get('/issues', verifyFBToken, async (req, res) => {
-      const email = req.query.email;
+      const { email, status, category } = req.query;
       const query = {};
-      if (email) {
-        query.reporterEmail = email;
-      }
+
+      if (email) query.reporterEmail = email;
+      if (status) query.status = status;
+      if (category) query.category = category;
       const option = {
         sort: { createdAt: -1 }
       }
@@ -406,7 +484,10 @@ async function run() {
           at: new Date()
         };
         const update = {
-          $set: data,
+          $set: {
+            ...data,
+            updatedAt: new Date()
+          },
           $push: { timeline: timelineEntry }
         }
         const result = await issuesCollection.updateOne({ _id: objectId }, update);
@@ -419,7 +500,7 @@ async function run() {
         res.send(result);
       };
     })
-    app.patch('/issues/:id/assign-staff', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.patch('/issues/:id/assign-staff', verifyFBToken, async (req, res) => {
       const { id } = req.params;
       const { staff } = req.body;
 
@@ -447,7 +528,7 @@ async function run() {
 
       res.send({ success: true });
     });
-    app.patch('/issues/:id/reject', verifyFBToken, verifyAdmin, async (req, res) => {
+    app.patch('/issues/:id/reject', verifyFBToken, async (req, res) => {
       const { id } = req.params;
 
       const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
@@ -480,6 +561,16 @@ async function run() {
       const email = req.decoded_email;
 
       try {
+        const user = await userCollection.findOne({ email });
+        if (!user) {
+          return res.status(401).send({ message: 'Unauthorized' });
+        }
+
+        if (user.status === 'blocked') {
+          return res.status(403).send({
+            message: 'Your account is blocked. You cannot upvote issues.'
+          });
+        }
         const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
         if (!issue) return res.status(404).send({ message: 'Issue not found' });
 
@@ -493,7 +584,7 @@ async function run() {
 
         const result = await issuesCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $push: { upVotes: email } } 
+          { $push: { upVotes: email } }
         );
 
         const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
@@ -509,7 +600,7 @@ async function run() {
     });
 
     // payment api
-    app.post('/create-payment-intent', verifyFBToken, async (req, res) => {
+    app.post('/create-payment-intent', async (req, res) => {
       const email = req.decoded_email;
 
       const user = await userCollection.findOne({ email });
@@ -589,15 +680,24 @@ async function run() {
         }
       }
     });
-    app.get('/all-payments', verifyFBToken, verifyAdmin, async (req, res) => {
-      // admin email
+    app.get('/all-payments', verifyFBToken, async (req, res) => {
       const adminEmail = 'admin@gmail.com';
       if (req.decoded_email !== adminEmail) {
-        return res.status(403).send({ message: ' access' })
+        return res.status(403).send({ message: 'access denied' })
       }
-      const result = await paymentsCollection.find().sort({ paidAt: -1 }).toArray();
+
+      const { from, to } = req.query;
+      const query = {};
+
+      if (from || to) {
+        query.paidAt = {};
+        if (from) query.paidAt.$gte = new Date(from);
+        if (to) query.paidAt.$lte = new Date(to);
+      }
+
+      const result = await paymentsCollection.find(query).sort({ paidAt: -1 }).toArray();
       res.send(result);
-    })
+    });
     //Citizen Aggregation Pipeline api
     const issueStatsPipeline = (email) => [
       {
