@@ -1,3 +1,4 @@
 node_modules
 .env
 issue-reporting-system--firebase-admin.json
+.vercel

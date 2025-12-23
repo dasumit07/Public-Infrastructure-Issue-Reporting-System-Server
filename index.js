@@ -5,7 +5,9 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express()
 const port = process.env.PORT || 3000
 const admin = require("firebase-admin");
-const serviceAccount = require("./issue-reporting-system--firebase-admin.json");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -600,7 +602,7 @@ async function run() {
     });
 
     // payment api
-    app.post('/create-payment-intent', async (req, res) => {
+    app.post('/create-payment-intent', verifyFBToken, async (req, res) => {
       const email = req.decoded_email;
 
       const user = await userCollection.findOne({ email });
@@ -900,8 +902,8 @@ async function run() {
 
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
@@ -913,6 +915,4 @@ app.get('/', (req, res) => {
   res.send('Hello World!')
 })
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
-})
+module.exports = app;
